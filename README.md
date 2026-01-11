@@ -7,7 +7,7 @@ pip install pandas numpy xgboost scikit-learn
 Download the dataset from Kaggle and place the CSV files in the project directory.
 
 # Train Model & Generate Submission
-python fraud_xgb_magic.py
+```python fraud_xgb_magic.py```
 
 # Output
 
