@@ -18,7 +18,7 @@ The core of this solution is the identification of unique cardholders (UIDs) and
 
 Below is the result of our model performance on the Kaggle leaderboard:
 
-![Kaggle Result](results.jpeg)
+![Kaggle Result](results.png)
 
 ## Getting Started
 
