@@ -3,7 +3,59 @@ import numpy as np
 import xgboost as xgb
 import gc
 import datetime
+import optuna
+import os
 from sklearn.metrics import roc_auc_score
+
+def reduce_mem_usage(df, verbose=True):
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2
+    for col in df.columns:
+        col_type = df[col].dtypes
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose: print('Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+    return df
+
+# HYPERPARAMETER TUNING
+def objective(trial, X_tr, y_tr, X_va, y_va):
+    param = {
+        'n_estimators': 5000,
+        'max_depth': trial.suggest_int('max_depth', 9, 15),
+        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
+        'subsample': trial.suggest_float('subsample', 0.7, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.3, 0.7),
+        'gamma': trial.suggest_float('gamma', 0, 10),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+        'missing': -1,
+        'eval_metric': 'auc',
+        'tree_method': 'hist',
+        'grow_policy': 'lossguide',
+        'n_jobs': -1,
+        'early_stopping_rounds': 200,
+        'random_state': 42
+    }
+    
+    clf = xgb.XGBClassifier(**param)
+    clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    
+    return roc_auc_score(y_va, clf.predict_proba(X_va)[:, 1])
 
 # ENCODING FUNCTIONS
 
@@ -131,6 +183,10 @@ def main():
 
     X_train = train_transaction.merge(train_identity, on='TransactionID', how='left')
     X_test = test_transaction.merge(test_identity, on='TransactionID', how='left')
+    
+    X_train = reduce_mem_usage(X_train)
+    X_test = reduce_mem_usage(X_test)
+
     y_train = X_train['isFraud'].copy()
 
     del train_transaction, train_identity, test_transaction, test_identity
@@ -149,9 +205,97 @@ def main():
 
     # FEATURE ENGINEERING
     print('Feature engineering...')
+
+    # CLEAN IDENTITY FEATURES
+    print('Cleaning Identity features...')
     
+    # OS cleaning
+    def group_os(df):
+        df['id_30'] = df['id_30'].fillna('unknown')
+        df.loc[df['id_30'].str.contains('Windows', na=False), 'id_30'] = 'windows'
+        df.loc[df['id_30'].str.contains('iOS', na=False), 'id_30'] = 'ios'
+        df.loc[df['id_30'].str.contains('Mac OS', na=False), 'id_30'] = 'mac'
+        df.loc[df['id_30'].str.contains('Android', na=False), 'id_30'] = 'android'
+        df.loc[df['id_30'].str.contains('Linux', na=False), 'id_30'] = 'linux'
+        return df
+    
+    X_train = group_os(X_train)
+    X_test = group_os(X_test)
+
+    # Browser cleaning
+    X_train['id_31'] = X_train['id_31'].str.lower().str.replace(r'[^a-z]', '', regex=True)
+    X_test['id_31'] = X_test['id_31'].str.lower().str.replace(r'[^a-z]', '', regex=True)
+    
+    def group_browser(df):
+        df.loc[df['id_31'].str.contains('chrome', na=False), 'id_31'] = 'chrome'
+        df.loc[df['id_31'].str.contains('firefox', na=False), 'id_31'] = 'firefox'
+        df.loc[df['id_31'].str.contains('safari', na=False), 'id_31'] = 'safari'
+        df.loc[df['id_31'].str.contains('edge', na=False), 'id_31'] = 'edge'
+        df.loc[df['id_31'].str.contains('ie', na=False), 'id_31'] = 'ie'
+        df.loc[df['id_31'].str.contains('opera', na=False), 'id_31'] = 'opera'
+        return df
+    
+    X_train = group_browser(X_train)
+    X_test = group_browser(X_test)
+
+    # Resolution features
+    print('Processing resolution features...')
+    X_train['screen_width'] = X_train['id_33'].str.split('x', expand=True)[0].fillna(-1)
+    X_train['screen_height'] = X_train['id_33'].str.split('x', expand=True)[1].fillna(-1)
+    X_test['screen_width'] = X_test['id_33'].str.split('x', expand=True)[0].fillna(-1)
+    X_test['screen_height'] = X_test['id_33'].str.split('x', expand=True)[1].fillna(-1)
+    
+    # Convert to numeric safely
+    X_train['screen_width'] = pd.to_numeric(X_train['screen_width'], errors='coerce').fillna(-1).astype(np.int32)
+    X_train['screen_height'] = pd.to_numeric(X_train['screen_height'], errors='coerce').fillna(-1).astype(np.int32)
+    X_test['screen_width'] = pd.to_numeric(X_test['screen_width'], errors='coerce').fillna(-1).astype(np.int32)
+    X_test['screen_height'] = pd.to_numeric(X_test['screen_height'], errors='coerce').fillna(-1).astype(np.int32)
+    
+    # Pixel count feature
+    X_train['pixel_count'] = X_train['screen_width'] * X_train['screen_height']
+    X_test['pixel_count'] = X_test['screen_width'] * X_test['screen_height']
+
+    # EMAIL DOMAIN CLEANING
+    print('Cleaning email domains...')
+    emails = {'gmail': 'google', 'att.net': 'att', 'twc.com': 'spectrum', 
+              'scantech.com': 'etc', 'netzero.net': 'netzero', 
+              'prodigy.net.mx': 'at&t', 'charter.net': 'spectrum', 
+              'live.com.mx': 'microsoft', 'connection.com.mx': 'etc', 
+              'icloud.com': 'apple', 'ymail.com': 'yahoo', 
+              'frontier.com': 'yahoo', 'rocketmail.com': 'yahoo', 
+              'nmgb.com.mx': 'etc', 'netzero.com': 'netzero', 
+              'bellsouth.net': 'at&t', 'hotmail.es': 'microsoft', 
+              'hotmail.com': 'microsoft', 'live.com': 'microsoft', 
+              'me.com': 'apple', 'msn.com': 'microsoft', 
+              'yahoo.com.mx': 'yahoo', 'yahoo.com': 'yahoo', 
+              'earthlink.net': 'earthlink', 'roadrunner.com': 'spectrum', 
+              'verizon.net': 'verizon', 'outlook.com': 'microsoft', 
+              'cox.net': 'cox', 'att.net': 'att', 'sbcglobal.net': 'at&t', 
+              'aim.com': 'aol', 'foxmail.com': 'etc', 'twc.com': 'spectrum', 
+              'frontiernet.net': 'yahoo', 'gmail.com': 'google', 
+              'juno.com': 'etc', 'optimum.net': 'etc', 
+              'cableone.net': 'etc', 'windstream.net': 'etc', 
+              'suddenlink.net': 'etc', 'web.de': 'etc', 
+              'outlook.es': 'microsoft', 'gmx.de': 'etc', 
+              'yahoo.fr': 'yahoo', 'yahoo.es': 'yahoo', 
+              'yahoo.de': 'yahoo', 'yahoo.co.uk': 'yahoo', 
+              'yahoo.co.jp': 'yahoo', 'live.fr': 'microsoft', 
+              'live.de': 'microsoft', 'hotmail.fr': 'microsoft', 
+              'hotmail.co.uk': 'microsoft', 'hotmail.de': 'microsoft'}
+
+    for col in ['P_emaildomain', 'R_emaildomain']:
+        X_train[col+'_bin'] = X_train[col].map(emails)
+        X_test[col+'_bin'] = X_test[col].map(emails)
+    
+    # TRANSACTION AMT FEATURES
+    print('Processing TransactionAmt...')
+    X_train['TransactionAmt_Log'] = np.log(X_train['TransactionAmt'])
+    X_test['TransactionAmt_Log'] = np.log(X_test['TransactionAmt'])
+    X_train['TransactionAmt_decimal'] = ((X_train['TransactionAmt'] - X_train['TransactionAmt'].astype(int)) * 1000).astype(int)
+    X_test['TransactionAmt_decimal'] = ((X_test['TransactionAmt'] - X_test['TransactionAmt'].astype(int)) * 1000).astype(int)
+
     # LABEL ENCODE CATEGORICAL
-    cat_cols = ['ProductCD', 'card4', 'card6', 'P_emaildomain', 'R_emaildomain', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9', 'id_12', 'id_15', 'id_16', 'id_23', 'id_27', 'id_28', 'id_29', 'id_30', 'id_31', 'id_33', 'id_34', 'id_35', 'id_36', 'id_37', 'id_38', 'DeviceType', 'DeviceInfo']
+    cat_cols = ['ProductCD', 'card4', 'card6', 'P_emaildomain', 'R_emaildomain', 'P_emaildomain_bin', 'R_emaildomain_bin', 'M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9', 'id_12', 'id_15', 'id_16', 'id_23', 'id_27', 'id_28', 'id_29', 'id_30', 'id_31', 'id_33', 'id_34', 'id_35', 'id_36', 'id_37', 'id_38', 'DeviceType', 'DeviceInfo']
     for col in cat_cols:
         if col in X_train.columns:
             encode_LE(col, X_train, X_test)
@@ -168,18 +312,28 @@ def main():
     X_test['uid'] = X_test.card1.astype(str)+'_'+X_test.card2.astype(str)+'_'+X_test.card3.astype(str)+'_'+X_test.card4.astype(str)+'_'+X_test.addr1.astype(str)+'_'+X_test.addr2.astype(str)
 
     # FREQUENCY ENCODING
-    X_train, X_test = encode_FE(X_train, X_test, ['card1', 'card2', 'card3', 'card5', 'card1_addr1', 'card1_addr1_P_emaildomain'])
+    X_train, X_test = encode_FE(X_train, X_test, ['card1', 'card2', 'card3', 'card5', 'card1_addr1', 'card1_addr1_P_emaildomain', 'id_30', 'id_31'])
 
     # GROUP AGGREGATIONS
     X_train, X_test = encode_AG(['TransactionAmt', 'D4', 'D9', 'D10', 'D15'], ['card1', 'card1_addr1', 'uid'], ['mean', 'std'], X_train, X_test)
     X_train, X_test = encode_AG2(['C1', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'C10', 'C11', 'C12', 'C13', 'C14'], ['card1', 'card1_addr1', 'uid'], X_train, X_test)
     X_train, X_test = encode_AG2(['M1','M2','M3','M4','M5','M6','M7','M8','M9'], ['card1','card1_addr1','uid'], X_train, X_test)
-
+    X_train, X_test = encode_AG(['C13', 'V310'], ['card1', 'card1_addr1', 'uid'], ['mean'], X_train, X_test)
     
+    # NEW: Aggregations by email
+    X_train, X_test = encode_AG(['TransactionAmt'], ['P_emaildomain_bin'], ['mean', 'std'], X_train, X_test)
+
     X_train['Transaction_hour'] = np.floor(X_train['TransactionDT'] / 3600) % 24
     X_test['Transaction_hour'] = np.floor(X_test['TransactionDT'] / 3600) % 24
-    X_train, X_test = encode_FE(X_train, X_test, ['Transaction_hour'])
+    X_train['Transaction_day'] = np.floor(X_train['TransactionDT'] / (3600*24)) % 7
+    X_test['Transaction_day'] = np.floor(X_test['TransactionDT'] / (3600*24)) % 7
+    X_train, X_test = encode_FE(X_train, X_test, ['Transaction_hour', 'Transaction_day'])
     
+    # NULL COUNT
+    print('Calculating null counts...')
+    X_train['null_count'] = X_train.isnull().sum(axis=1)
+    X_test['null_count'] = X_test.isnull().sum(axis=1)
+
     # Prune Redundant V Columns
     # The 1st place solution drops 219 V columns.
     # We will drop columns with high correlation (>0.99)
@@ -217,30 +371,59 @@ def main():
     X_va = X_train.iloc[split_idx:]
     y_va = y_train.iloc[split_idx:]
     
-
     non_numeric = X_train.select_dtypes(exclude=[np.number]).columns
     if len(non_numeric) > 0:
         print(f'Warning: Non-numeric columns found: {list(non_numeric)}. Label encoding them...')
         for col in non_numeric:
             encode_LE(col, X_train, X_test, verbose=False)
             
-    # Final check and fillna for XGB
     X_train = X_train.astype('float32')
     X_test = X_test.astype('float32')
+    
+    X_train = reduce_mem_usage(X_train)
+    X_test = reduce_mem_usage(X_test)
+    gc.collect()
+
     X_tr = X_train.iloc[:split_idx]
     X_va = X_train.iloc[split_idx:]
 
-    clf = xgb.XGBClassifier( 
-        n_estimators=2000,
-        max_depth=12, 
-        learning_rate=0.02, 
-        subsample=0.8,
-        colsample_bytree=0.4, 
-        missing=-1, 
-        eval_metric='auc',
-        tree_method='hist', 
-        early_stopping_rounds=100
-    )
+    # OPTIONAL HYPERPARAMETER TUNING
+    run_tuning = False # Set to True to run Optuna tuning
+    if run_tuning:
+        print('Starting hyperparameter tuning...')
+        study = optuna.create_study(direction='maximize')
+        study.optimize(lambda trial: objective(trial, X_tr, y_tr, X_va, y_va), n_trials=20)
+        print('Best trial:', study.best_trial.params)
+        best_params = study.best_trial.params
+        best_params.update({
+            'n_estimators': 5000,
+            'missing': -1,
+            'eval_metric': 'auc',
+            'tree_method': 'hist',
+            'grow_policy': 'lossguide',
+            'n_jobs': -1,
+            'early_stopping_rounds': 200,
+            'random_state': 42
+        })
+    else:
+        best_params = {
+            'n_estimators': 5000,
+            'max_depth': 12,
+            'learning_rate': 0.0107,
+            'subsample': 0.7632,
+            'colsample_bytree': 0.58,
+            'gamma': 2.75,
+            'min_child_weight': 4,
+            'missing': -1,
+            'eval_metric': 'auc',
+            'tree_method': 'hist',
+            'grow_policy': 'lossguide',
+            'n_jobs': -1,
+            'early_stopping_rounds': 200,
+            'random_state': 42
+        }
+
+    clf = xgb.XGBClassifier(**best_params)
 
     clf.fit(X_tr, y_tr, 
         eval_set=[(X_va, y_va)],
