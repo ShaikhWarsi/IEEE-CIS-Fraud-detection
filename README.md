@@ -1,6 +1,7 @@
-# IEEE-CIS Fraud Detection: XGBoost "Magic" Model
+# IEEE-CIS-Fraud-detection
 
-This project implements a high-performance fraud detection pipeline using XGBoost, focusing on advanced feature engineering techniques (the "Magic" features) to identify unique credit card behavior in the IEEE-CIS Fraud Detection dataset.
+Build a high‑performance fraud detection model using XGBoost, leveraging unique cardholder identifiers and sophisticated feature engineering on the IEEE‑CIS dataset. The pipeline normalizes temporal features, applies frequency and group aggregations, and produces a submission ready for Kaggle competition.
+
 
 ## Project Overview
 
